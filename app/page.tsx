@@ -371,6 +371,46 @@ export default function Home() {
     };
   }, []);
 
+  // Real-time SSE listener for instant webhook push updates (no loop polling)
+  useEffect(() => {
+    if (!activeRequestId || !["sent", "processing"].includes(status) || isReplacingSignedFile) {
+      return;
+    }
+
+    let eventSource: EventSource | null = null;
+    let isCancelled = false;
+
+    try {
+      eventSource = new EventSource(`/api/esign/stream/${encodeURIComponent(activeRequestId)}`);
+
+      eventSource.onmessage = async (event) => {
+        if (isCancelled || !event.data || event.data.trim() === "" || event.data.startsWith(":")) return;
+        try {
+          const data = JSON.parse(event.data);
+          const nextState = String(data.state || "").toUpperCase();
+          if (["COMPLETED", "REJECTED"].includes(nextState)) {
+            await doCheckStatus(activeRequestId);
+          }
+        } catch {
+          // ignore non-json ping
+        }
+      };
+
+      eventSource.onerror = () => {
+        if (eventSource) eventSource.close();
+      };
+    } catch {
+      // fallback
+    }
+
+    return () => {
+      isCancelled = true;
+      if (eventSource) {
+        eventSource.close();
+      }
+    };
+  }, [activeRequestId, status, isReplacingSignedFile]);
+
   const replaceWithSignedPdf = async (options: { identityKey?: string; url?: string }, signRequestId: string) => {
     const query = options.identityKey
       ? `identityKey=${encodeURIComponent(options.identityKey)}`
