@@ -362,8 +362,24 @@ const worker = {
       }
     }
 
-    if (url.pathname === "/api/esign/webhook") {
+    const isWebhookPath = [
+      "/api/esign/webhook",
+      "/esign/webhook",
+      "/webhook",
+      "/api/webhook",
+    ].includes(url.pathname);
+
+    if (isWebhookPath) {
       const traceId = crypto.randomUUID();
+
+      console.info("[esign.webhook] Request received", {
+        traceId,
+        method: request.method,
+        pathname: url.pathname,
+        search: url.search,
+        userAgent: request.headers.get("user-agent"),
+        contentType: request.headers.get("content-type"),
+      });
 
       if (request.method === "OPTIONS") {
         return new Response(null, {
@@ -377,18 +393,29 @@ const worker = {
       }
 
       if (!env.ESIGN_WEBHOOK_SECRET) {
-        console.error("[esign.webhook] missing webhook secret", { traceId });
+        console.error("[esign.webhook] missing webhook secret configuration", { traceId });
         return Response.json({ message: "Webhook chưa được cấu hình.", traceId }, { status: 500 });
       }
 
       const receivedToken =
         url.searchParams.get("token")
+        || url.searchParams.get("secret")
+        || url.searchParams.get("key")
         || request.headers.get("x-webhook-token")
         || request.headers.get("x-token")
+        || request.headers.get("x-secret-key")
+        || request.headers.get("x-api-key")
         || request.headers.get("authorization")?.replace(/^Bearer\s+/i, "");
 
-      if (receivedToken !== env.ESIGN_WEBHOOK_SECRET) {
-        console.warn("[esign.webhook] unauthorized", { traceId });
+      const isTokenValid =
+        receivedToken === env.ESIGN_WEBHOOK_SECRET
+        || (env.ESIGN_SECRET_KEY && receivedToken === env.ESIGN_SECRET_KEY);
+
+      if (!isTokenValid) {
+        console.warn("[esign.webhook] unauthorized attempt", {
+          traceId,
+          receivedTokenPreview: receivedToken ? `${receivedToken.slice(0, 6)}...` : "none",
+        });
         return Response.json({ message: "Webhook token không hợp lệ.", traceId }, { status: 401 });
       }
 
@@ -408,21 +435,21 @@ const worker = {
       if (request.method === "POST") {
         try {
           const rawText = await request.text();
-          console.info("[esign.webhook] incoming body", { traceId, bodyPreview: sanitizeLogText(rawText) });
+          console.info("[esign.webhook] incoming body payload", { traceId, bodyPreview: sanitizeLogText(rawText) });
 
           if (!rawText || !rawText.trim()) {
-            return Response.json({ ok: true, message: "Webhook ping received", traceId });
+            return Response.json({ ok: true, message: "Webhook ping received (empty body)", traceId });
           }
 
           let payload: Record<string, unknown> = {};
           try {
             payload = JSON.parse(rawText) as Record<string, unknown>;
           } catch {
-            return Response.json({ ok: true, message: "Webhook ping received", traceId });
+            return Response.json({ ok: true, message: "Webhook ping received (non-json)", traceId });
           }
 
-          const signRequest = ((payload.signRequest || payload) || {}) as Record<string, unknown>;
-          const signRequestId = (signRequest.signRequestId || signRequest.sign_request_id) as string | undefined;
+          const signRequest = ((payload.signRequest || payload.data || payload) || {}) as Record<string, unknown>;
+          const signRequestId = (signRequest.signRequestId || signRequest.sign_request_id || payload.signRequestId || payload.sign_request_id) as string | undefined;
           const nextState = String(signRequest.state || payload.state || "").toUpperCase();
           const identityKey = (signRequest.identityKey || signRequest.identity_key || payload.identityKey || payload.identity_key) as string | undefined;
           const identityKeyExpiresAt = (signRequest.identityKeyExpiresAt || signRequest.identity_key_expires_at || payload.identityKeyExpiresAt || payload.identity_key_expires_at) as string | undefined;
@@ -432,8 +459,10 @@ const worker = {
 
           // If this is a test ping / verification from BankHub Console
           if (!signRequestId || !nextState || !["COMPLETED", "REJECTED"].includes(nextState)) {
-            console.info("[esign.webhook] received verification ping / unhandled payload", {
+            console.info("[esign.webhook] received verification ping / non-terminal state", {
               traceId,
+              signRequestId,
+              nextState,
               payloadSnippet: sanitizeLogText(rawText),
             });
             return Response.json({

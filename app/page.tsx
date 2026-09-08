@@ -587,8 +587,11 @@ export default function Home() {
   };
 
   const createNewRequest = async () => {
-    pollingIdRef.current = null;
-    clearPollSchedule();
+    setForm({
+      ...initialForm,
+      organizationName: form.organizationName || "Cas Sign",
+    });
+    setTouched({});
     setOriginalFileName("");
     setFile(null);
     setPdf(null);
@@ -603,10 +606,6 @@ export default function Home() {
     setActiveRequestId("");
     setCheckingStatus(false);
     setIsReplacingSignedFile(false);
-    autoPollAttemptsRef.current = 0;
-    setAutoPollingStopped(false);
-    setPollAttempt(0);
-    setPollPhase("idle");
     setQrUrl("");
     setQrContent("");
     setSignToken("");
