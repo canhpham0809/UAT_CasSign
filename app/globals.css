@@ -91,10 +91,11 @@ input.invalid { border-color:#d56656; background:#fff9f7; box-shadow:0 0 0 3px #
 .notice.rejected { background:#fff0f0; color:#c53030; border:1px solid #fecaca; }
 .notice.error { background:#fff1ee; color:#9f3f31; border:1px solid #fca5a5; }
 .notice svg { flex:0 0 auto; margin-top:1px; }
-.poll-controls { margin-bottom:9px; padding:9px; border:1px solid #ead49f; border-radius:8px; background:#fffaf0; display:grid; gap:7px; }
-.poll-controls > span { display:flex; align-items:center; justify-content:center; gap:5px; color:#785716; font-size:9px; font-weight:700; }
-.poll-controls button { height:32px; border:1px solid #d8bd7e; border-radius:7px; background:#fff; color:#765513; display:flex; align-items:center; justify-content:center; gap:6px; font-size:9px; font-weight:800; }
-.poll-controls button:disabled { opacity:.55; cursor:wait; }
+.manual-status-card { margin-bottom:9px; padding:10px 12px; border:1px solid #b8dbc9; border-radius:10px; background:#f0f9f4; display:grid; gap:8px; }
+.manual-status-info { display:flex; align-items:center; justify-content:center; gap:6px; color:#185a3e; font-size:10px; font-weight:700; }
+.manual-status-btn { height:36px; border:1px solid #168057; border-radius:8px; background:var(--green); color:#fff; display:flex; align-items:center; justify-content:center; gap:7px; font-size:11px; font-weight:800; cursor:pointer; transition:.15s; }
+.manual-status-btn:hover { background:var(--green-dark); }
+.manual-status-btn:disabled { opacity:.65; cursor:wait; }
 .signed-time { margin:-2px 0 8px; text-align:center; color:#607068; font-size:9px; }
 .document-area { min-width:0; background:#f2f4f2; display:flex; flex-direction:column; height:calc(100vh - 62px); position:sticky; top:62px; }
 .replace-file-overlay { position:absolute; inset:64px 0 0; z-index:20; background:#f2f4f2e8; backdrop-filter:blur(2px); display:flex; flex-direction:column; align-items:center; justify-content:center; gap:8px; color:var(--green); }
@@ -161,13 +162,9 @@ input.invalid { border-color:#d56656; background:#fff9f7; box-shadow:0 0 0 3px #
 .qr-btn.secondary { background:#f0f5f2; color:#30453b; border-color:#cbdcd2; }
 .qr-btn.secondary:hover { background:#e4eee7; }
 .qr-btn.copied { background:#e9f5ef; color:var(--green); border-color:#a2d6bc; }
-.qr-poll-status { width:100%; border-radius:10px; padding:12px; font-size:11px; display:flex; flex-direction:column; gap:6px; text-align:left; background:#f9fbfa; border:1px solid #e2ede6; }
-.qr-poll-status.waiting { background:#fffaf0; border-color:#fae5b5; color:#785716; }
-.qr-poll-status.polling { background:#f0f8f4; border-color:#c2e2d1; color:#185a3e; }
-.qr-poll-status.completed { background:#e9f7ef; border-color:#9fd8b8; color:#0e5e3a; }
-.qr-poll-status.stopped { background:#f7f8f8; border-color:#dde3e0; color:#506058; }
-.poll-progress-bar { width:100%; height:4px; background:#e0e8e3; border-radius:99px; overflow:hidden; }
-.poll-progress-fill { height:100%; background:var(--green); border-radius:99px; transition:width .3s; }
+.qr-guide-box { width:100%; border-radius:10px; padding:12px; font-size:11px; text-align:left; background:#f0f8f4; border:1px solid #c2e2d1; }
+.qr-guide-text { display:flex; align-items:flex-start; gap:8px; color:#185a3e; line-height:1.45; }
+.qr-btn.qr-check-btn { flex:1; font-weight:800; }
 .modal-footer { padding:12px 20px; border-top:1px solid #edf2ee; background:#fcfdfc; display:flex; align-items:center; justify-content:space-between; }
 
 /* Sidebar Re-open QR Button */

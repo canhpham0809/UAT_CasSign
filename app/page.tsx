@@ -20,6 +20,7 @@ import {
   RefreshCw,
   Send,
   ShieldCheck,
+  Smartphone,
   UploadCloud,
   X,
   XCircle,
@@ -275,11 +276,6 @@ function PdfPage({ pdf, pageNumber, fields, selectedId, locked, onSelect, onMove
 export default function Home() {
   const inputRef = useRef<HTMLInputElement>(null);
   const documentScrollRef = useRef<HTMLDivElement>(null);
-  const pollTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const pollIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
-  const countdownTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
-  const pollingIdRef = useRef<string | null>(null);
-  const autoPollAttemptsRef = useRef(0);
 
   const [form, setForm] = useState(initialForm);
   const [activeRequestId, setActiveRequestId] = useState("");
@@ -298,12 +294,8 @@ export default function Home() {
   const [message, setMessage] = useState("");
   const [signedAt, setSignedAt] = useState("");
   const [isSignedPreview, setIsSignedPreview] = useState(false);
-  const [countdown, setCountdown] = useState(0);
   const [checkingStatus, setCheckingStatus] = useState(false);
   const [isReplacingSignedFile, setIsReplacingSignedFile] = useState(false);
-  const [pollAttempt, setPollAttempt] = useState(0);
-  const [autoPollingStopped, setAutoPollingStopped] = useState(false);
-  const [pollPhase, setPollPhase] = useState<"idle" | "initial_wait" | "polling" | "stopped">("idle");
 
   // QR Code Modal States
   const [qrUrl, setQrUrl] = useState("");
@@ -333,16 +325,6 @@ export default function Home() {
   }, [fields.length, file, form, isBusinessSigning]);
   const canSubmit = Object.keys(validationErrors).length === 0 && !isFileLocked;
   const validationHint = Object.values(validationErrors)[0];
-
-  const clearPollSchedule = () => {
-    if (pollTimerRef.current) clearTimeout(pollTimerRef.current);
-    if (pollIntervalRef.current) clearInterval(pollIntervalRef.current);
-    if (countdownTimerRef.current) clearInterval(countdownTimerRef.current);
-    pollTimerRef.current = null;
-    pollIntervalRef.current = null;
-    countdownTimerRef.current = null;
-    setCountdown(0);
-  };
 
   // Restore session from IndexedDB on component mount
   useEffect(() => {
@@ -386,8 +368,6 @@ export default function Home() {
 
     return () => {
       isCancelled = true;
-      pollingIdRef.current = null;
-      clearPollSchedule();
     };
   }, []);
 
@@ -431,6 +411,7 @@ export default function Home() {
     try {
       const response = await fetch(`/api/esign/status/${encodeURIComponent(signRequestId)}`, { cache: "no-store" });
       if (!response.ok) {
+        setMessage("Chưa thể cập nhật trạng thái lúc này. Vui lòng thử lại sau.");
         return false;
       }
       const result = (await response.json()) as Record<string, unknown>;
@@ -440,8 +421,6 @@ export default function Home() {
       const targetUrl = typeof signStatus?.signedFileUrl === "string" ? signStatus.signedFileUrl : undefined;
 
       if (nextState === "COMPLETED") {
-        clearPollSchedule();
-        setPollPhase("idle");
         const signedTimestamp = (signStatus?.signedAt as string) || (signStatus?.lastUpdatedAt as string) || new Date().toISOString();
 
         if (targetKey || targetUrl) {
@@ -486,8 +465,6 @@ export default function Home() {
       }
 
       if (["REJECTED", "FAILED", "CANCELLED", "EXPIRED"].includes(nextState || "")) {
-        clearPollSchedule();
-        setPollPhase("idle");
         const rejectMsg = nextState === "REJECTED"
           ? `Người ký đã từ chối yêu cầu ký.${signStatus?.rejectedReason ? ` Lý do: ${signStatus.rejectedReason}` : ""}`
           : `Yêu cầu ký đã kết thúc với trạng thái ${nextState}.`;
@@ -504,67 +481,14 @@ export default function Home() {
       }
 
       setStatus("processing");
-      setMessage(`Đang chờ ký${nextState ? ` · ${nextState}` : ""}.`);
+      setMessage(`Yêu cầu đang chờ ký trên Cas ID${nextState ? ` (${nextState})` : ""}. Vui lòng ký trên app rồi bấm Cập nhật trạng thái.`);
       return false;
     } catch {
+      setMessage("Không thể kết nối máy chủ để kiểm tra trạng thái.");
       return false;
     } finally {
       setCheckingStatus(false);
     }
-  };
-
-  const startUatPolling = (signRequestId: string) => {
-    clearPollSchedule();
-    pollingIdRef.current = signRequestId;
-    autoPollAttemptsRef.current = 0;
-    setPollAttempt(0);
-    setAutoPollingStopped(false);
-    setPollPhase("initial_wait");
-    setCountdown(30);
-
-    let remain = 30;
-    countdownTimerRef.current = setInterval(() => {
-      remain -= 1;
-      setCountdown(Math.max(0, remain));
-      if (remain <= 0 && countdownTimerRef.current) {
-        clearInterval(countdownTimerRef.current);
-        countdownTimerRef.current = null;
-      }
-    }, 1000);
-
-    // Call first check 30s after push request
-    pollTimerRef.current = setTimeout(async () => {
-      if (pollingIdRef.current !== signRequestId) return;
-      setPollPhase("polling");
-      autoPollAttemptsRef.current = 1;
-      setPollAttempt(1);
-
-      const isTerminal = await doCheckStatus(signRequestId);
-      if (isTerminal) return;
-
-      // After 30s check, poll every 5s for up to 10 attempts total
-      pollIntervalRef.current = setInterval(async () => {
-        if (pollingIdRef.current !== signRequestId) {
-          if (pollIntervalRef.current) clearInterval(pollIntervalRef.current);
-          return;
-        }
-
-        autoPollAttemptsRef.current += 1;
-        const currentAttempt = autoPollAttemptsRef.current;
-        setPollAttempt(currentAttempt);
-
-        const done = await doCheckStatus(signRequestId);
-        if (done || currentAttempt >= 10) {
-          if (pollIntervalRef.current) clearInterval(pollIntervalRef.current);
-          pollIntervalRef.current = null;
-          if (!done && currentAttempt >= 10) {
-            setAutoPollingStopped(true);
-            setPollPhase("stopped");
-            setMessage("Đã hoàn thành 10 lần kiểm tra tự động (50s). Vui lòng bấm 'Cập nhật trạng thái thủ công' nếu cần kiểm tra tiếp.");
-          }
-        }
-      }, 5000);
-    }, 30000);
   };
 
   const checkStatusNow = async () => {
@@ -800,8 +724,6 @@ export default function Home() {
         qrUrl: generatedQrUrl,
         message: "Hồ sơ đã gửi thành công. Vui lòng quét mã QR trên Cas ID để ký.",
       });
-
-      startUatPolling(signRequestId);
     } catch (error) {
       setStatus("error");
       setMessage(error instanceof Error ? error.message : "Không thể gửi yêu cầu ký.");
@@ -903,17 +825,19 @@ export default function Home() {
             )}
 
             {["sent", "processing"].includes(status) && activeRequestId && !isReplacingSignedFile && (
-              <div className="poll-controls">
-                {pollPhase === "initial_wait" ? (
-                  <span><Clock3 size={13} /> Sẽ tự động kiểm tra sau {countdown}s...</span>
-                ) : autoPollingStopped ? (
-                  <span><Clock3 size={13} /> Đã hết 10 lần tự động kiểm tra</span>
-                ) : (
-                  <span><LoaderCircle className="spin" size={13} /> Đang tự động kiểm tra ({pollAttempt}/10 lần)</span>
-                )}
-                <button type="button" disabled={checkingStatus} onClick={checkStatusNow}>
+              <div className="manual-status-card">
+                <div className="manual-status-info">
+                  <Clock3 size={13} />
+                  <span>Đang chờ ký trên Cas ID</span>
+                </div>
+                <button
+                  type="button"
+                  className="manual-status-btn"
+                  disabled={checkingStatus}
+                  onClick={checkStatusNow}
+                >
                   {checkingStatus ? <LoaderCircle className="spin" size={14} /> : <RefreshCw size={14} />}
-                  {checkingStatus ? "Đang kiểm tra..." : "Cập nhật trạng thái thủ công"}
+                  {checkingStatus ? "Đang cập nhật trạng thái..." : "Cập nhật trạng thái ký"}
                 </button>
               </div>
             )}
@@ -1010,50 +934,29 @@ export default function Home() {
                 </button>
               </div>
 
-              <div className={`qr-poll-status ${status === "completed" ? "completed" : pollPhase === "initial_wait" ? "waiting" : autoPollingStopped ? "stopped" : "polling"}`}>
-                {status === "completed" ? (
-                  <div style={{ display: "flex", alignItems: "center", gap: 6, fontWeight: 700 }}>
-                    <CheckCircle2 size={16} /> Đã ký thành công! Đang cập nhật tài liệu...
-                  </div>
-                ) : pollPhase === "initial_wait" ? (
-                  <>
-                    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-                      <span>Chờ ký trên Cas ID...</span>
-                      <strong>Tự động kiểm tra sau: {countdown}s</strong>
-                    </div>
-                    <div className="poll-progress-bar">
-                      <div className="poll-progress-fill" style={{ width: `${((30 - countdown) / 30) * 100}%` }} />
-                    </div>
-                  </>
-                ) : autoPollingStopped ? (
-                  <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
-                    <Clock3 size={15} /> Đã hoàn thành 10 lần kiểm tra tự động.
-                  </div>
-                ) : (
-                  <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
-                    <LoaderCircle className="spin" size={15} />
-                    <span>Đang kiểm tra trạng thái (Lần {pollAttempt}/10, mỗi 5s)...</span>
-                  </div>
-                )}
+              <div className="qr-guide-box">
+                <div className="qr-guide-text">
+                  <Smartphone size={16} style={{ color: "var(--green)", flexShrink: 0 }} />
+                  <span>Quét mã bằng app <strong>Cas ID</strong> và hoàn tất ký. Sau khi ký xong, nhấn nút <strong>Cập nhật trạng thái ký</strong> để hiển thị file.</span>
+                </div>
               </div>
             </div>
 
             <div className="modal-footer">
               <button
                 type="button"
-                className="qr-btn secondary"
-                style={{ width: "auto", padding: "0 14px" }}
+                className="qr-btn primary qr-check-btn"
                 disabled={checkingStatus}
                 onClick={checkStatusNow}
               >
-                {checkingStatus ? <LoaderCircle className="spin" size={14} /> : <RefreshCw size={14} />}
-                {checkingStatus ? "Đang kiểm tra..." : "Kiểm tra ngay"}
+                {checkingStatus ? <LoaderCircle className="spin" size={15} /> : <RefreshCw size={15} />}
+                {checkingStatus ? "Đang cập nhật..." : "Cập nhật trạng thái ký"}
               </button>
 
               <button
                 type="button"
-                className="qr-btn primary"
-                style={{ width: "auto", padding: "0 18px" }}
+                className="qr-btn secondary"
+                style={{ width: "auto", padding: "0 16px" }}
                 onClick={() => setShowQrModal(false)}
               >
                 Đóng
