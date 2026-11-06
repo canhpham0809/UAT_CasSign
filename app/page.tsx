@@ -5,15 +5,16 @@ import Link from "next/link";
 import QRCode from "qrcode";
 import {
   AlertCircle,
+  Building2,
   CheckCircle2,
   ChevronDown,
-  Clock3,
   Copy,
   Download,
   ExternalLink,
   FileSignature,
   FileText,
   GripVertical,
+  Info,
   LoaderCircle,
   Plus,
   QrCode,
@@ -22,10 +23,24 @@ import {
   ShieldCheck,
   Smartphone,
   UploadCloud,
+  User,
+  Users,
   X,
   XCircle,
 } from "lucide-react";
 import { clearSessionState, loadSessionState, saveSessionState } from "./session-storage";
+import {
+  ERROR_CODES,
+  FIELD_TYPES,
+  TAX_CODE_PATTERN,
+  describeErrorCode,
+  errorCodeTip,
+  floorRatio,
+  validateSignatureFields,
+  type ApiErrorBody,
+  type FieldType,
+  type SignType,
+} from "../lib/request-document";
 
 type SignatureField = {
   id: string;
@@ -34,7 +49,61 @@ type SignatureField = {
   yRatio: number;
   widthRatio: number;
   heightRatio: number;
-  fieldType: "SIGNATURE";
+  fieldType: FieldType;
+};
+
+/** "" = không chỉ định signType, người ký tự chọn loại ký trên Cas ID. */
+type SignTypeChoice = "" | SignType;
+
+const SIGN_TYPE_OPTIONS: Array<{ value: SignTypeChoice; label: string; hint: string }> = [
+  { value: "", label: "Tự chọn", hint: "Không gửi signType. Người ký tự chọn ký cá nhân hoặc doanh nghiệp trên Cas ID." },
+  { value: "PERSONAL", label: "Cá nhân", hint: "Bắt buộc ký bằng chứng thư cá nhân. Người ký không được đổi loại ký." },
+  { value: "BUSINESS", label: "Doanh nghiệp", hint: "Bắt buộc ký bằng chứng thư doanh nghiệp. Người ký không được đổi loại ký." },
+];
+
+const FIELD_TYPE_LABELS: Record<FieldType, string> = {
+  SIGNATURE: "Chữ ký",
+  INITIAL: "Ký nháy",
+  STAMP: "Con dấu",
+};
+
+type ErrorDetail = {
+  title: string;
+  code?: string;
+  requestId?: string;
+  items: string[];
+};
+
+class ApiRequestError extends Error {
+  detail: ErrorDetail;
+  constructor(detail: ErrorDetail) {
+    super(detail.items[0] ? `${detail.title}: ${detail.items.join("; ")}` : detail.title);
+    this.detail = detail;
+  }
+}
+
+/** Read the eSign error body { requestId, errorType, errorCode, errorMessage } into a structured error. */
+const parseApiError = async (response: Response, fallbackMessage: string): Promise<ApiRequestError> => {
+  const traceId = response.headers.get("x-cas-trace-id") || undefined;
+  let body: (ApiErrorBody & { message?: string; traceId?: string }) | null = null;
+  try {
+    const text = await response.clone().text();
+    body = text ? JSON.parse(text) : null;
+  } catch {
+    body = null;
+  }
+  if (!body || (!body.errorCode && !body.errorMessage)) {
+    const message = await parseResponseErrorMessage(response, fallbackMessage);
+    return new ApiRequestError({ title: message, items: [], requestId: body?.requestId || traceId });
+  }
+  const code = body.errorCode;
+  const rawMessage = (body.errorMessage || "").trim();
+  // INVALID_PARAM gộp nhiều lỗi bằng dấu phẩy -> tách thành từng dòng.
+  const items = code === ERROR_CODES.INVALID_PARAM
+    ? rawMessage.split(",").map((item) => item.trim()).filter(Boolean)
+    : rawMessage ? [rawMessage] : [];
+  const title = describeErrorCode(code) || (code ? "Hệ thống ký từ chối yêu cầu" : fallbackMessage);
+  return new ApiRequestError({ title, code, requestId: body.requestId || body.traceId || traceId, items });
 };
 
 type FormState = {
@@ -120,6 +189,7 @@ const parseResponseErrorMessage = async (response: Response, fallbackMessage: st
     // Reading body failed
   }
 
+  if (response.status === 429) extractedMsg = "Hệ thống ký đang nhận quá nhiều yêu cầu. Vui lòng thử lại sau ít phút (HTTP 429).";
   if (extractedMsg) return extractedMsg;
   if (response.status === 400) extractedMsg = "Dữ liệu yêu cầu không hợp lệ (HTTP 400).";
   else if (response.status === 401) extractedMsg = "Không có quyền truy cập. Vui lòng kiểm tra lại thông tin xác thực (HTTP 401).";
@@ -145,6 +215,15 @@ const defaultField = (page = 1, index = 0): SignatureField => ({
   fieldType: "SIGNATURE",
 });
 
+/** Normalise one field into API coordinates (origin bottom-left) and make sure it never overflows the page. */
+const toPayloadField = (field: SignatureField) => {
+  const widthRatio = floorRatio(field.widthRatio);
+  const heightRatio = floorRatio(field.heightRatio);
+  const xRatio = Math.min(floorRatio(field.xRatio), floorRatio(1 - widthRatio));
+  const yRatio = Math.min(floorRatio(1 - field.yRatio - field.heightRatio), floorRatio(1 - heightRatio));
+  return { page: field.page, xRatio, yRatio, widthRatio, heightRatio, fieldType: field.fieldType };
+};
+
 type PdfDocumentProxy = {
   numPages: number;
   getPage: (pageNumber: number) => Promise<{
@@ -157,11 +236,32 @@ type PdfDocumentProxy = {
   }>;
 };
 
-function PdfPage({ pdf, pageNumber, fields, selectedId, locked, onSelect, onMove, onResize, onDelete }: {
+function RequestIdChip({ id }: { id: string }) {
+  const [copied, setCopied] = useState(false);
+  return (
+    <button
+      type="button"
+      className="request-id-chip"
+      title="Sao chép mã yêu cầu"
+      onClick={() => {
+        navigator.clipboard?.writeText(id);
+        setCopied(true);
+        setTimeout(() => setCopied(false), 1500);
+      }}
+    >
+      <span>Mã yêu cầu</span>
+      <code>{id}</code>
+      {copied ? <CheckCircle2 size={12} /> : <Copy size={12} />}
+    </button>
+  );
+}
+
+function PdfPage({ pdf, pageNumber, fields, selectedId, invalidIds, locked, onSelect, onMove, onResize, onDelete }: {
   pdf: PdfDocumentProxy;
   pageNumber: number;
   fields: SignatureField[];
   selectedId: string | null;
+  invalidIds: Set<string>;
   locked: boolean;
   onSelect: (id: string) => void;
   onMove: (id: string, x: number, y: number) => void;
@@ -175,21 +275,28 @@ function PdfPage({ pdf, pageNumber, fields, selectedId, locked, onSelect, onMove
     let cancelled = false;
     let renderTask: { promise: Promise<void>; cancel?: () => void } | undefined;
     (async () => {
-      const page = await pdf.getPage(pageNumber);
-      if (cancelled || !canvasRef.current) return;
-      const base = page.getViewport({ scale: 1 });
-      const scale = Math.min(1.35, 760 / base.width);
-      const viewport = page.getViewport({ scale });
-      const canvas = canvasRef.current;
-      const ratio = window.devicePixelRatio || 1;
-      canvas.width = Math.floor(viewport.width * ratio);
-      canvas.height = Math.floor(viewport.height * ratio);
-      canvas.style.width = `${viewport.width}px`;
-      canvas.style.height = `${viewport.height}px`;
-      const context = canvas.getContext("2d");
-      if (!context) return;
-      renderTask = page.render({ canvasContext: context, viewport, transform: ratio !== 1 ? [ratio, 0, 0, ratio, 0, 0] : undefined });
-      await renderTask.promise;
+      try {
+        const page = await pdf.getPage(pageNumber);
+        if (cancelled || !canvasRef.current) return;
+        const base = page.getViewport({ scale: 1 });
+        const scale = Math.min(1.35, 760 / base.width);
+        const viewport = page.getViewport({ scale });
+        const canvas = canvasRef.current;
+        const ratio = window.devicePixelRatio || 1;
+        canvas.width = Math.floor(viewport.width * ratio);
+        canvas.height = Math.floor(viewport.height * ratio);
+        canvas.style.width = `${viewport.width}px`;
+        canvas.style.height = `${viewport.height}px`;
+        const context = canvas.getContext("2d");
+        if (!context) return;
+        renderTask = page.render({ canvasContext: context, viewport, transform: ratio !== 1 ? [ratio, 0, 0, ratio, 0, 0] : undefined });
+        await renderTask.promise;
+      } catch (error) {
+        // Huỷ render là bình thường khi đổi file (VD: thay bằng bản đã ký) hoặc unmount trang.
+        const name = (error as { name?: string } | null)?.name;
+        if (cancelled || name === "RenderingCancelledException") return;
+        console.warn(`[pdf] render page ${pageNumber} failed`, error);
+      }
     })();
     return () => {
       cancelled = true;
@@ -248,7 +355,7 @@ function PdfPage({ pdf, pageNumber, fields, selectedId, locked, onSelect, onMove
         {fields.map((field, index) => (
           <div
             key={field.id}
-            className={`signature-box ${selectedId === field.id ? "selected" : ""} ${locked ? "locked" : ""}`}
+            className={`signature-box ${selectedId === field.id ? "selected" : ""} ${locked ? "locked" : ""} ${invalidIds.has(field.id) ? "invalid" : ""} type-${field.fieldType.toLowerCase()}`}
             style={{
               left: `${field.xRatio * 100}%`,
               top: `${field.yRatio * 100}%`,
@@ -263,7 +370,7 @@ function PdfPage({ pdf, pageNumber, fields, selectedId, locked, onSelect, onMove
             aria-label={`Vùng ký ${index + 1} trên trang ${pageNumber}`}
           >
             <GripVertical size={16} />
-            <span>Chữ ký {index + 1}</span>
+            <span>{FIELD_TYPE_LABELS[field.fieldType] || "Chữ ký"} {index + 1}</span>
             {!locked && <button className="delete-signature" type="button" onPointerDown={(e) => e.stopPropagation()} onClick={(e) => { e.stopPropagation(); onDelete(field.id); }} aria-label={`Xoá vùng ký ${index + 1}`}><X size={13} /></button>}
             <span className="resize-handle" onPointerDown={(e) => startResize(e, field)} aria-hidden="true" />
           </div>
@@ -279,7 +386,7 @@ export default function Home() {
 
   const [form, setForm] = useState(initialForm);
   const [activeRequestId, setActiveRequestId] = useState("");
-  const [isBusinessSigning, setIsBusinessSigning] = useState(false);
+  const [signType, setSignType] = useState<SignTypeChoice>("");
   const [touched, setTouched] = useState<Partial<Record<keyof FormState, boolean>>>({});
   const [originalFileName, setOriginalFileName] = useState("");
   const [file, setFile] = useState<File | null>(null);
@@ -292,10 +399,22 @@ export default function Home() {
   const [submitting, setSubmitting] = useState(false);
   const [status, setStatus] = useState<"draft" | "sent" | "processing" | "completed" | "rejected" | "error">("draft");
   const [message, setMessage] = useState("");
+  const [errorDetail, setErrorDetail] = useState<ErrorDetail | null>(null);
+  // MST bị hệ thống ký từ chối (không tìm thấy DN / CTS) -> tô đỏ ô MST đến khi người dùng sửa.
+  const [serverTaxError, setServerTaxError] = useState(false);
   const [signedAt, setSignedAt] = useState("");
   const [isSignedPreview, setIsSignedPreview] = useState(false);
   const [checkingStatus, setCheckingStatus] = useState(false);
   const [isReplacingSignedFile, setIsReplacingSignedFile] = useState(false);
+  const [showCancelConfirm, setShowCancelConfirm] = useState(false);
+  const [keepAfterCancel, setKeepAfterCancel] = useState(true);
+  const [checkNote, setCheckNote] = useState("");
+  const [liveConnected, setLiveConnected] = useState(false);
+  // Mã yêu cầu đang theo dõi; dùng để bỏ qua kết quả trạng thái trả về sau khi đã huỷ.
+  const activeRequestRef = useRef("");
+  useEffect(() => {
+    activeRequestRef.current = activeRequestId;
+  }, [activeRequestId]);
 
   // QR Code Modal States
   const [qrUrl, setQrUrl] = useState("");
@@ -304,8 +423,23 @@ export default function Home() {
   const [showQrModal, setShowQrModal] = useState(false);
   const [copiedLink, setCopiedLink] = useState(false);
 
+  // Esc đóng popup QR
+  useEffect(() => {
+    if (!showQrModal) return;
+    const onKey = (event: KeyboardEvent) => { if (event.key === "Escape") setShowQrModal(false); };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [showQrModal]);
+
   const selected = useMemo(() => fields.find((item) => item.id === selectedId), [fields, selectedId]);
   const isFileLocked = status === "sent" || status === "processing" || status === "rejected" || submitting;
+  const isFormLocked = isFileLocked || status === "completed";
+  const phase: "draft" | "waiting" | "finalizing" | "completed" | "rejected" = isReplacingSignedFile
+    ? "finalizing"
+    : status === "sent" || status === "processing" ? "waiting"
+      : status === "completed" ? "completed"
+        : status === "rejected" ? "rejected"
+          : "draft";
   const validationErrors = useMemo(() => {
     const errors: Partial<Record<keyof FormState | "file" | "fields", string>> = {};
     if (!form.organizationName.trim()) errors.organizationName = "Vui lòng nhập Gửi từ yêu cầu.";
@@ -313,16 +447,22 @@ export default function Home() {
     if (!documentName) errors.documentName = "Vui lòng nhập tên tài liệu.";
     else if (documentName.length < 10) errors.documentName = "Tên tài liệu phải từ 10 ký tự trở lên.";
     else if (documentName.length > 200) errors.documentName = "Tên tài liệu không được vượt quá 200 ký tự.";
-    if (isBusinessSigning) {
+    if (signType === "BUSINESS") {
       const taxCode = form.taxCode.trim();
-      if (!taxCode) errors.taxCode = "Vui lòng nhập mã số thuế.";
-      else if (!/^\d{10}(?:-\d{3})?$/.test(taxCode)) errors.taxCode = "Mã số thuế gồm 10 số hoặc 10 số-3 số.";
+      if (taxCode && !TAX_CODE_PATTERN.test(taxCode)) errors.taxCode = "Mã số thuế gồm 10 số hoặc 10 số-3 số (VD: 0123456789-001).";
     }
     if (!file) errors.file = "Vui lòng tải lên file PDF.";
     else if (file.size > 20 * 1024 * 1024) errors.file = "File PDF không được vượt quá 20 MB.";
     if (fields.length === 0) errors.fields = "Cần đặt ít nhất một vùng ký.";
+    else {
+      const fieldProblems = validateSignatureFields(fields.map(toPayloadField), pageCount || undefined);
+      if (fieldProblems.length) errors.fields = fieldProblems[0];
+    }
     return errors;
-  }, [fields.length, file, form, isBusinessSigning]);
+  }, [fields, file, form, signType, pageCount]);
+  const invalidFieldIds = useMemo(() => new Set(
+    fields.filter((field) => validateSignatureFields([toPayloadField(field)], pageCount || undefined).length > 0).map((field) => field.id),
+  ), [fields, pageCount]);
   const canSubmit = Object.keys(validationErrors).length === 0 && !isFileLocked;
   const validationHint = Object.values(validationErrors)[0];
 
@@ -335,14 +475,15 @@ export default function Home() {
         if (!saved || isCancelled) return;
 
         if (saved.form) setForm(saved.form);
-        if (saved.isBusinessSigning !== undefined) setIsBusinessSigning(saved.isBusinessSigning);
+        if (saved.signType !== undefined) setSignType(saved.signType);
+        else if (saved.isBusinessSigning) setSignType("BUSINESS");
         if (saved.originalFileName) setOriginalFileName(saved.originalFileName);
         if (saved.activeRequestId) setActiveRequestId(saved.activeRequestId);
         if (saved.status) setStatus(saved.status);
         if (saved.message) setMessage(saved.message);
         if (saved.signedAt) setSignedAt(saved.signedAt);
         if (saved.isSignedPreview !== undefined) setIsSignedPreview(saved.isSignedPreview);
-        if (saved.fields) setFields(saved.fields);
+        if (saved.fields) setFields(saved.fields.map((field) => ({ ...field, fieldType: FIELD_TYPES.includes(field.fieldType) ? field.fieldType : "SIGNATURE" })));
         if (saved.qrContent) setQrContent(saved.qrContent);
         if (saved.signToken) setSignToken(saved.signToken);
         if (saved.qrUrl) setQrUrl(saved.qrUrl);
@@ -382,6 +523,9 @@ export default function Home() {
 
     try {
       eventSource = new EventSource(`/api/esign/stream/${encodeURIComponent(activeRequestId)}`);
+      eventSource.onopen = () => {
+        if (!isCancelled) setLiveConnected(true);
+      };
 
       eventSource.onmessage = async (event) => {
         if (isCancelled || !event.data || event.data.trim() === "" || event.data.startsWith(":")) return;
@@ -397,6 +541,7 @@ export default function Home() {
       };
 
       eventSource.onerror = () => {
+        if (!isCancelled) setLiveConnected(false);
         if (eventSource) eventSource.close();
       };
     } catch {
@@ -405,6 +550,7 @@ export default function Home() {
 
     return () => {
       isCancelled = true;
+      setLiveConnected(false);
       if (eventSource) {
         eventSource.close();
       }
@@ -451,10 +597,11 @@ export default function Home() {
     try {
       const response = await fetch(`/api/esign/status/${encodeURIComponent(signRequestId)}`, { cache: "no-store" });
       if (!response.ok) {
-        setMessage("Chưa thể cập nhật trạng thái lúc này. Vui lòng thử lại sau.");
+        setCheckNote("Chưa thể kiểm tra trạng thái lúc này. Vui lòng thử lại sau.");
         return false;
       }
       const result = (await response.json()) as Record<string, unknown>;
+      if (activeRequestRef.current !== signRequestId) return false; // yêu cầu đã bị huỷ trong lúc chờ phản hồi
       const signStatus = (result.signRequestStatus || (result.signRequestId || result.state ? result : result.data)) as Record<string, unknown> | undefined;
       const nextState = typeof signStatus?.state === "string" ? signStatus.state.toUpperCase() : undefined;
       const targetKey = typeof signStatus?.identityKey === "string" ? signStatus.identityKey : undefined;
@@ -521,10 +668,10 @@ export default function Home() {
       }
 
       setStatus("processing");
-      setMessage(`Yêu cầu đang chờ ký trên Cas ID${nextState ? ` (${nextState})` : ""}. Vui lòng ký trên app rồi bấm Cập nhật trạng thái.`);
+      setCheckNote(`Chưa có kết quả ký${nextState ? ` (${nextState})` : ""} · kiểm tra lúc ${new Date().toLocaleTimeString("vi-VN")}`);
       return false;
     } catch {
-      setMessage("Không thể kết nối máy chủ để kiểm tra trạng thái.");
+      setCheckNote("Không thể kết nối máy chủ để kiểm tra trạng thái.");
       return false;
     } finally {
       setCheckingStatus(false);
@@ -626,11 +773,40 @@ export default function Home() {
     saveSessionState({ fields: nextFields });
   };
 
+  /**
+   * Thoát khỏi yêu cầu hiện tại (đang chờ ký / bị từ chối) về bản nháp.
+   * keepDocument = giữ file, thông tin, vùng ký để chỉnh và gửi lại; ngược lại xoá sạch phiên.
+   * Lưu ý: chưa có API huỷ phía server, nên đây chỉ là ngừng theo dõi ở trình duyệt.
+   */
+  const resetToDraft = async (keepDocument: boolean, note: string) => {
+    if (!keepDocument) {
+      await createNewRequest();
+      setMessage(note);
+      return;
+    }
+    activeRequestRef.current = "";
+    setShowCancelConfirm(false);
+    setShowQrModal(false);
+    setActiveRequestId("");
+    setStatus("draft");
+    setMessage(note);
+    setErrorDetail(null);
+    setCheckNote("");
+    setCheckingStatus(false);
+    setQrUrl("");
+    setQrContent("");
+    setSignToken("");
+    await saveSessionState({ status: "draft", activeRequestId: "", qrUrl: "", qrContent: "", signToken: "", message: note });
+  };
+
   const createNewRequest = async () => {
+    activeRequestRef.current = "";
+    setShowCancelConfirm(false);
     setForm({
       ...initialForm,
       organizationName: form.organizationName || "Cas Sign",
     });
+    setSignType("");
     setTouched({});
     setOriginalFileName("");
     setFile(null);
@@ -641,6 +817,9 @@ export default function Home() {
     setTargetPage(1);
     setStatus("draft");
     setMessage("");
+    setErrorDetail(null);
+    setCheckNote("");
+    setKeepAfterCancel(true);
     setSignedAt("");
     setIsSignedPreview(false);
     setActiveRequestId("");
@@ -688,13 +867,16 @@ export default function Home() {
   const submit = async (event: React.FormEvent) => {
     event.preventDefault();
     if (!canSubmit || !file) {
-      setTouched({ documentName: true, organizationName: true, taxCode: isBusinessSigning });
+      setTouched({ documentName: true, organizationName: true, taxCode: signType === "BUSINESS" });
       setStatus("error");
+      setErrorDetail(null);
       setMessage(validationHint || "Vui lòng kiểm tra lại thông tin trước khi gửi.");
       return;
     }
     setSubmitting(true);
     setMessage("");
+    setErrorDetail(null);
+    setCheckNote("");
     try {
       const signRequestId = createSignRequestId();
       setActiveRequestId(signRequestId);
@@ -705,21 +887,15 @@ export default function Home() {
       }
       body.append("documentName", normalizeDocumentName(form.documentName));
       body.append("organizationName", form.organizationName.trim());
-      if (isBusinessSigning) body.append("taxCode", form.taxCode.trim());
-      body.append("signatureFields", JSON.stringify(fields.map((field) => ({
-        page: field.page,
-        xRatio: field.xRatio,
-        yRatio: Math.max(0, Math.min(1, 1 - field.yRatio - field.heightRatio)),
-        widthRatio: field.widthRatio,
-        heightRatio: field.heightRatio,
-        fieldType: field.fieldType,
-      }))));
+      if (signType) body.append("signType", signType);
+      // taxCode chỉ gửi khi ký doanh nghiệp: có MST thì bắt buộc ký bằng chứng thư của đúng doanh nghiệp đó.
+      if (signType === "BUSINESS" && form.taxCode.trim()) body.append("taxCode", form.taxCode.trim());
+      body.append("signatureFields", JSON.stringify(fields.map(toPayloadField)));
       body.append("file", file);
 
       const response = await fetch("/api/esign", { method: "POST", body });
       if (!response.ok) {
-        const errorMsg = await parseResponseErrorMessage(response, "Dịch vụ ký số chưa phản hồi thành công.");
-        throw new Error(errorMsg);
+        throw await parseApiError(response, "Dịch vụ ký số chưa phản hồi thành công.");
       }
 
       const rawText = await response.text();
@@ -765,7 +941,27 @@ export default function Home() {
       });
     } catch (error) {
       setStatus("error");
-      setMessage(error instanceof Error ? error.message : "Không thể gửi yêu cầu ký.");
+      if (error instanceof ApiRequestError) {
+        setErrorDetail(error.detail);
+        setMessage(error.detail.title);
+        setServerTaxError(signType === "BUSINESS" && !!form.taxCode.trim()
+          && [ERROR_CODES.BUSINESS_NOT_FOUND, ERROR_CODES.CERTIFICATE_NOT_FOUND].includes(error.detail.code as never));
+        // Đánh dấu lại các trường liên quan để người dùng thấy ngay chỗ cần sửa.
+        const text = `${error.detail.items.join(" ")} ${error.detail.code || ""}`.toLowerCase();
+        setTouched((prev) => ({
+          ...prev,
+          documentName: prev.documentName || text.includes("documentname"),
+          organizationName: prev.organizationName || text.includes("organizationname"),
+          taxCode: prev.taxCode || text.includes("taxcode"),
+        }));
+      } else {
+        setErrorDetail(null);
+        // fetch() ném TypeError khi mất mạng / không tới được máy chủ ("Failed to fetch", "Load failed"...).
+        const isNetworkError = error instanceof TypeError || (typeof navigator !== "undefined" && !navigator.onLine);
+        setMessage(isNetworkError
+          ? "Không kết nối được tới máy chủ. Vui lòng kiểm tra mạng rồi bấm Gửi lại. Thông tin và file vẫn được giữ nguyên."
+          : error instanceof Error ? error.message : "Không thể gửi yêu cầu ký.");
+      }
     } finally {
       setSubmitting(false);
     }
@@ -802,14 +998,46 @@ export default function Home() {
           </div>
 
           <div className="fields-grid">
-            <label className="wide-field"><span>CCCD <span className="optional-label">Không bắt buộc</span></span><input value={form.identificationNumber} onChange={(e) => setValue("identificationNumber", e.target.value)} placeholder="CCCD / CMND (không bắt buộc)" /></label>
-            <label className="wide-field"><span>Tên tài liệu <em>*</em> <span className="optional-label">Tối thiểu 10 ký tự</span></span><input maxLength={200} disabled={!file || isFileLocked || isSignedPreview} className={touched.documentName && validationErrors.documentName ? "invalid" : ""} value={form.documentName} onBlur={() => { touchField("documentName"); setValue("documentName", normalizeDocumentName(form.documentName)); }} onChange={(e) => setValue("documentName", e.target.value)} placeholder={file ? "Nhập tên tài liệu (tối thiểu 10 ký tự)" : "Upload PDF để nhập tên tài liệu"} /></label>
+            <label className="wide-field"><span>CCCD <span className="optional-label">Không bắt buộc</span></span><input disabled={isFormLocked} value={form.identificationNumber} onChange={(e) => setValue("identificationNumber", e.target.value)} placeholder="CCCD / CMND (không bắt buộc)" /></label>
+            <label className="wide-field"><span>Tên tài liệu <em>*</em> <span className="optional-label">Tối thiểu 10 ký tự</span></span><input maxLength={200} disabled={!file || isFormLocked || isSignedPreview} className={touched.documentName && validationErrors.documentName ? "invalid" : ""} value={form.documentName} onBlur={() => { touchField("documentName"); setValue("documentName", normalizeDocumentName(form.documentName)); }} onChange={(e) => setValue("documentName", e.target.value)} placeholder={file ? "Nhập tên tài liệu (tối thiểu 10 ký tự)" : "Upload PDF để nhập tên tài liệu"} /></label>
             {touched.documentName && validationErrors.documentName && <small className="field-error wide-field">{validationErrors.documentName}</small>}
-            <label className="wide-field"><span>Gửi từ <em>*</em></span><input className={touched.organizationName && validationErrors.organizationName ? "invalid" : ""} value={form.organizationName} onBlur={() => touchField("organizationName")} onChange={(e) => setValue("organizationName", e.target.value)} placeholder="Cas Sign" /></label>
+            <label className="wide-field"><span>Gửi từ <em>*</em></span><input disabled={isFormLocked} className={touched.organizationName && validationErrors.organizationName ? "invalid" : ""} value={form.organizationName} onBlur={() => touchField("organizationName")} onChange={(e) => setValue("organizationName", e.target.value)} placeholder="Cas Sign" /></label>
             {touched.organizationName && validationErrors.organizationName && <small className="field-error wide-field">{validationErrors.organizationName}</small>}
-            <label className="business-toggle wide-field"><input type="checkbox" checked={isBusinessSigning} onChange={(e) => { setIsBusinessSigning(e.target.checked); saveSessionState({ isBusinessSigning: e.target.checked }); if (!e.target.checked) setTouched((prev) => ({ ...prev, taxCode: false })); }} /><span><strong>Ký doanh nghiệp</strong><small>Yêu cầu mã số thuế</small></span></label>
-            {isBusinessSigning && <label className="wide-field tax-field"><span>Mã số thuế <em>*</em></span><input className={touched.taxCode && validationErrors.taxCode ? "invalid" : ""} value={form.taxCode} onBlur={() => touchField("taxCode")} onChange={(e) => setValue("taxCode", e.target.value)} placeholder="0123456789 hoặc 0123456789-001" inputMode="numeric" /></label>}
-            {isBusinessSigning && touched.taxCode && validationErrors.taxCode && <small className="field-error wide-field">{validationErrors.taxCode}</small>}
+            <div className="wide-field sign-type-field">
+              <span className="sign-type-label">Loại ký <span className="optional-label">Không bắt buộc</span></span>
+              <div className="sign-type-group" role="radiogroup" aria-label="Loại ký">
+                {SIGN_TYPE_OPTIONS.map((option) => (
+                  <button
+                    key={option.value || "AUTO"}
+                    type="button"
+                    role="radio"
+                    aria-checked={signType === option.value}
+                    disabled={isFormLocked}
+                    className={signType === option.value ? "active" : ""}
+                    onClick={() => {
+                      setSignType(option.value);
+                      setServerTaxError(false);
+                      saveSessionState({ signType: option.value, isBusinessSigning: option.value === "BUSINESS" });
+                      if (option.value !== "BUSINESS") setTouched((prev) => ({ ...prev, taxCode: false }));
+                      if (!["sent", "processing", "completed", "rejected"].includes(status)) setStatus("draft");
+                    }}
+                  >
+                    {option.value === "BUSINESS" ? <Building2 size={13} /> : option.value === "PERSONAL" ? <User size={13} /> : <Users size={13} />}
+                    {option.label}
+                  </button>
+                ))}
+              </div>
+              <small className="sign-type-hint"><Info size={11} />{SIGN_TYPE_OPTIONS.find((option) => option.value === signType)?.hint}</small>
+            </div>
+            {signType === "BUSINESS" && <label className="wide-field tax-field"><span>Mã số thuế <span className="optional-label">Không bắt buộc</span></span><input disabled={isFormLocked} className={(touched.taxCode && validationErrors.taxCode) || serverTaxError ? "invalid" : ""} value={form.taxCode} onBlur={() => touchField("taxCode")} onChange={(e) => { setServerTaxError(false); setValue("taxCode", e.target.value); }} placeholder="0123456789 hoặc 0123456789-001" inputMode="numeric" /></label>}
+            {signType === "BUSINESS" && touched.taxCode && validationErrors.taxCode && <small className="field-error wide-field">{validationErrors.taxCode}</small>}
+            {signType === "BUSINESS" && !validationErrors.taxCode && !serverTaxError && (
+              <small className="tax-hint wide-field">
+                {form.taxCode.trim()
+                  ? <>Người ký <strong>bắt buộc</strong> dùng chứng thư số của doanh nghiệp có MST <strong>{form.taxCode.trim()}</strong>.</>
+                  : <>Để trống: người ký dùng chứng thư số của bất kỳ doanh nghiệp nào họ có.</>}
+              </small>
+            )}
           </div>
 
           <div className="section-divider" />
@@ -826,77 +1054,152 @@ export default function Home() {
             <div className="file-card">
               <div className="file-icon"><FileText size={20} /></div>
               <div className="file-info"><strong>{file.name}</strong><span>{(file.size / 1024 / 1024).toFixed(2)} MB · {pageCount} trang</span></div>
-              <button type="button" disabled={isFileLocked} onClick={createNewRequest} aria-label="Bỏ file"><X size={17} /></button>
+              {phase === "draft" && <button type="button" disabled={submitting} onClick={createNewRequest} aria-label="Bỏ file" title="Bỏ file"><X size={17} /></button>}
             </div>
           )}
 
-          {selected && (
+          {selected && !isFormLocked && (
             <div className="field-editor">
-              <div><strong>Đang chọn: vùng {fields.findIndex((field) => field.id === selected.id) + 1}</strong></div>
-              <p>{isFileLocked ? "Vùng ký đã được khoá trong lúc chờ xử lý." : "Kéo cả khung để di chuyển · kéo chấm ở góc phải dưới để đổi kích thước."}</p>
+              <div><strong>Đang chọn: vùng {fields.findIndex((field) => field.id === selected.id) + 1} · Trang {selected.page}</strong></div>
+              <div className="field-type-group" role="radiogroup" aria-label="Loại vùng ký">
+                {FIELD_TYPES.map((type) => (
+                  <button
+                    key={type}
+                    type="button"
+                    role="radio"
+                    aria-checked={selected.fieldType === type}
+                    disabled={isFileLocked}
+                    className={selected.fieldType === type ? "active" : ""}
+                    onClick={() => updateField(selected.id, { fieldType: type })}
+                  >
+                    {FIELD_TYPE_LABELS[type]}
+                  </button>
+                ))}
+              </div>
+              <p>Kéo cả khung để di chuyển · kéo chấm ở góc phải dưới để đổi kích thước.</p>
+              {invalidFieldIds.has(selected.id) && <p className="field-editor-error">{validateSignatureFields([toPayloadField(selected)], pageCount || undefined)[0]}</p>}
             </div>
           )}
 
           <div className="submit-area">
-            {qrUrl && ["sent", "processing"].includes(status) && (
-              <button
-                type="button"
-                className="view-qr-button"
-                onClick={() => setShowQrModal(true)}
-              >
-                <QrCode size={15} /> Mở lại Popup quét mã QR
-              </button>
-            )}
-
-            {message && (
-              <div className={`notice ${status}`}>
-                {status === "completed" || status === "sent" ? (
-                  <CheckCircle2 size={17} />
-                ) : status === "processing" ? (
-                  <LoaderCircle className="spin" size={17} />
-                ) : status === "rejected" ? (
-                  <XCircle size={17} />
-                ) : (
-                  <AlertCircle size={17} />
+            {phase === "draft" && (
+              <>
+                {message && (
+                  <div className={`notice ${status === "error" ? "error" : "info"}`} role={status === "error" ? "alert" : "status"}>
+                    {status === "error" ? <AlertCircle size={17} /> : <Info size={17} />}
+                    <div className="notice-content">
+                      <span>{message}</span>
+                      {status === "error" && errorDetail && (
+                        <>
+                          {errorDetail.items.length > 0 && (
+                            <ul className="error-list">
+                              {errorDetail.items.map((item, index) => <li key={index}>{item}</li>)}
+                            </ul>
+                          )}
+                          {errorCodeTip(errorDetail.code) && <small className="error-tip">{errorCodeTip(errorDetail.code)}</small>}
+                          <div className="error-meta">
+                            {errorDetail.code && <code>{errorDetail.code}</code>}
+                            {errorDetail.requestId && (
+                              <button type="button" className="error-copy" onClick={() => navigator.clipboard?.writeText(errorDetail.requestId || "")} title="Sao chép mã yêu cầu">
+                                <Copy size={10} /> {errorDetail.requestId}
+                              </button>
+                            )}
+                          </div>
+                        </>
+                      )}
+                    </div>
+                  </div>
                 )}
-                <span>{message}</span>
-              </div>
+                <button className="submit-button" disabled={!canSubmit || submitting} type="submit">
+                  {submitting ? <LoaderCircle className="spin" size={18} /> : <Send size={18} />}
+                  {submitting ? "Đang gửi..." : "Gửi yêu cầu ký"}
+                </button>
+                {!canSubmit && !submitting && validationHint && <div className="validation-hint">{validationHint}</div>}
+                <span>Bằng việc tiếp tục, bạn xác nhận thông tin trên là chính xác.</span>
+              </>
             )}
 
-            {["sent", "processing"].includes(status) && activeRequestId && !isReplacingSignedFile && (
-              <div className="manual-status-card">
-                <div className="manual-status-info">
-                  <Clock3 size={13} />
-                  <span>Đang chờ ký trên Cas ID</span>
+            {phase === "waiting" && (
+              <div className="request-card waiting">
+                <div className="request-card-head">
+                  <span className={`live-dot ${liveConnected ? "on" : ""}`} aria-hidden="true" />
+                  <div className="request-card-title">
+                    <strong>Đang chờ người ký</strong>
+                    <small>{liveConnected ? "Trang sẽ tự cập nhật khi ký xong" : "Bấm làm mới để kiểm tra kết quả ký"}</small>
+                  </div>
+                  <button type="button" className="icon-btn" disabled={checkingStatus} onClick={checkStatusNow} title="Kiểm tra trạng thái ngay" aria-label="Kiểm tra trạng thái ngay">
+                    <RefreshCw size={15} className={checkingStatus ? "spin" : ""} />
+                  </button>
                 </div>
-                <button
-                  type="button"
-                  className="manual-status-btn"
-                  disabled={checkingStatus}
-                  onClick={checkStatusNow}
-                >
-                  {checkingStatus ? <LoaderCircle className="spin" size={14} /> : <RefreshCw size={14} />}
-                  {checkingStatus ? "Đang cập nhật trạng thái..." : "Cập nhật trạng thái ký"}
+                {activeRequestId && <RequestIdChip id={activeRequestId} />}
+                {checkNote && <small className="request-card-note">{checkNote}</small>}
+
+                {showCancelConfirm ? (
+                  <div className="cancel-inline" role="alertdialog" aria-labelledby="cancel-title">
+                    <strong id="cancel-title">Huỷ yêu cầu này?</strong>
+                    <p>Mã QR đã gửi có thể vẫn ký được trên Cas ID cho đến khi hết hạn.</p>
+                    <label className="cancel-keep-option">
+                      <input type="checkbox" checked={keepAfterCancel} onChange={(e) => setKeepAfterCancel(e.target.checked)} />
+                      <span>Giữ lại tài liệu và vùng ký để chỉnh sửa, gửi lại</span>
+                    </label>
+                    <div className="cancel-inline-actions">
+                      <button type="button" className="btn-danger" onClick={() => resetToDraft(keepAfterCancel, "Đã huỷ yêu cầu ký.")}>Huỷ yêu cầu</button>
+                      <button type="button" className="btn-ghost" onClick={() => setShowCancelConfirm(false)}>Không</button>
+                    </div>
+                  </div>
+                ) : (
+                  <>
+                    {qrUrl && (
+                      <button type="button" className="submit-button" onClick={() => setShowQrModal(true)}>
+                        <QrCode size={18} /> Hiện mã QR để ký
+                      </button>
+                    )}
+                    <button type="button" className="link-btn danger" onClick={() => setShowCancelConfirm(true)}>Huỷ yêu cầu</button>
+                  </>
+                )}
+              </div>
+            )}
+
+            {phase === "finalizing" && (
+              <div className="request-card waiting">
+                <div className="request-card-head">
+                  <LoaderCircle className="spin" size={18} />
+                  <div className="request-card-title"><strong>Đã ký xong</strong><small>Đang tải bản PDF đã ký…</small></div>
+                </div>
+              </div>
+            )}
+
+            {phase === "completed" && (
+              <div className="request-card done">
+                <div className="request-card-head">
+                  <CheckCircle2 size={20} />
+                  <div className="request-card-title">
+                    <strong>Đã ký hoàn tất</strong>
+                    <small>{signedAt ? `Ký lúc ${new Date(signedAt).toLocaleString("vi-VN")}` : "Tài liệu đã được ký"}</small>
+                  </div>
+                </div>
+                {activeRequestId && <RequestIdChip id={activeRequestId} />}
+                {!isSignedPreview && message && <small className="request-card-note warn">{message}</small>}
+                {isSignedPreview && (
+                  <button type="button" className="submit-button" onClick={downloadSignedPdf}><Download size={18} /> Tải file đã ký</button>
+                )}
+                <button type="button" className={isSignedPreview ? "link-btn" : "submit-button"} onClick={createNewRequest}>
+                  {!isSignedPreview && <Plus size={18} />} Tạo yêu cầu mới
                 </button>
               </div>
             )}
 
-            {status === "completed" && signedAt && <div className="signed-time">Ký lúc {new Date(signedAt).toLocaleString("vi-VN")}</div>}
-            {["completed", "rejected"].includes(status) ? (
-              <div className="completed-actions">
-                {isSignedPreview && <button className="download-signed" type="button" onClick={downloadSignedPdf}><Download size={17} /> Tải file đã ký</button>}
-                <button className="submit-button new-request" type="button" onClick={createNewRequest}>
-                  <RefreshCw size={18} /> Tạo yêu cầu mới
-                </button>
+            {phase === "rejected" && (
+              <div className="request-card rejected">
+                <div className="request-card-head">
+                  <XCircle size={20} />
+                  <div className="request-card-title"><strong>Người ký đã từ chối</strong><small>{message.replace(/^Người ký đã từ chối yêu cầu ký\.\s*/, "") || "Hệ thống ký chưa trả về lý do từ chối."}</small></div>
+                </div>
+                {activeRequestId && <RequestIdChip id={activeRequestId} />}
+                <button type="button" className="submit-button" onClick={() => resetToDraft(true, "")}><RefreshCw size={18} /> Chỉnh sửa &amp; gửi lại</button>
+                <button type="button" className="link-btn" onClick={createNewRequest}>Tạo yêu cầu mới</button>
               </div>
-            ) : (
-              <button className="submit-button" disabled={!canSubmit || submitting} type="submit">
-                {submitting ? <LoaderCircle className="spin" size={18} /> : <Send size={18} />}
-                {submitting ? "Đang gửi..." : "Gửi yêu cầu ký"}
-              </button>
             )}
-            {!canSubmit && !["sent", "processing", "completed", "rejected"].includes(status) && validationHint && <div className="validation-hint">{validationHint}</div>}
-            <span>Bằng việc tiếp tục, bạn xác nhận thông tin trên là chính xác.</span>
           </div>
         </aside>
 
@@ -928,6 +1231,7 @@ export default function Home() {
                     pageNumber={index + 1}
                     fields={fields.filter((field) => field.page === index + 1)}
                     selectedId={selectedId}
+                    invalidIds={invalidFieldIds}
                     locked={isFileLocked}
                     onSelect={(id) => { setSelectedId(id); setTargetPage(index + 1); }}
                     onMove={(id, x, y) => updateField(id, { xRatio: x, yRatio: y })}
@@ -944,62 +1248,29 @@ export default function Home() {
       {/* QR Code Modal Popup */}
       {showQrModal && qrUrl && (
         <div className="modal-backdrop" onClick={() => setShowQrModal(false)}>
-          <div className="modal-card" onClick={(e) => e.stopPropagation()}>
-            <div className="modal-header">
-              <h3><QrCode size={18} style={{ color: "var(--green)" }} /> Quét mã QR để ký tài liệu</h3>
-              <button type="button" className="modal-close" onClick={() => setShowQrModal(false)} aria-label="Đóng popup">
-                <X size={16} />
-              </button>
-            </div>
-
-            <div className="modal-body">
+          <div className="modal-card qr-modal" role="dialog" aria-modal="true" aria-labelledby="qr-title" onClick={(e) => e.stopPropagation()}>
+            <button type="button" className="modal-close floating" onClick={() => setShowQrModal(false)} aria-label="Đóng">
+              <X size={16} />
+            </button>
+            <div className="qr-modal-body">
+              <h3 id="qr-title">Quét mã để ký</h3>
+              <p className="qr-caption"><Smartphone size={14} /> Mở app <strong>Cas ID</strong> và quét mã bên dưới</p>
               <div className="qr-frame">
                 {/* eslint-disable-next-line @next/next/no-img-element */}
                 <img src={qrUrl} alt="Mã QR ký tài liệu" className="qr-image" />
               </div>
-
-              {signToken && <div className="qr-token-pill">Token: {signToken}</div>}
-
-              <div className="qr-actions-row">
-                <a href={qrContent} target="_blank" rel="noopener noreferrer" className="qr-btn primary">
-                  <ExternalLink size={14} /> Mở liên kết ký
-                </a>
-                <button
-                  type="button"
-                  className={`qr-btn secondary ${copiedLink ? "copied" : ""}`}
-                  onClick={copyQrLink}
-                >
-                  <Copy size={14} /> {copiedLink ? "Đã sao chép" : "Sao chép link"}
-                </button>
+              {signToken && <div className="qr-token-pill">Mã xác nhận: <strong>{signToken}</strong></div>}
+              <div className="qr-live">
+                <span className={`live-dot ${liveConnected ? "on" : ""}`} aria-hidden="true" />
+                <span>{checkingStatus ? "Đang kiểm tra…" : liveConnected ? "Đang chờ ký · tự cập nhật khi xong" : "Đang chờ ký"}</span>
+                <button type="button" className="link-btn inline" disabled={checkingStatus} onClick={checkStatusNow}>Kiểm tra ngay</button>
               </div>
-
-              <div className="qr-guide-box">
-                <div className="qr-guide-text">
-                  <Smartphone size={16} style={{ color: "var(--green)", flexShrink: 0 }} />
-                  <span>Quét mã bằng app <strong>Cas ID</strong> và hoàn tất ký. Sau khi ký xong, nhấn nút <strong>Cập nhật trạng thái ký</strong> để hiển thị file.</span>
-                </div>
+              {checkNote && <small className="request-card-note">{checkNote}</small>}
+              <div className="qr-links">
+                <button type="button" className="link-btn inline" onClick={copyQrLink}><Copy size={12} /> {copiedLink ? "Đã sao chép" : "Sao chép link ký"}</button>
+                <span aria-hidden="true">·</span>
+                <a className="link-btn inline" href={qrContent} target="_blank" rel="noopener noreferrer"><ExternalLink size={12} /> Mở trên thiết bị này</a>
               </div>
-            </div>
-
-            <div className="modal-footer">
-              <button
-                type="button"
-                className="qr-btn primary qr-check-btn"
-                disabled={checkingStatus}
-                onClick={checkStatusNow}
-              >
-                {checkingStatus ? <LoaderCircle className="spin" size={15} /> : <RefreshCw size={15} />}
-                {checkingStatus ? "Đang cập nhật..." : "Cập nhật trạng thái ký"}
-              </button>
-
-              <button
-                type="button"
-                className="qr-btn secondary"
-                style={{ width: "auto", padding: "0 16px" }}
-                onClick={() => setShowQrModal(false)}
-              >
-                Đóng
-              </button>
             </div>
           </div>
         </div>

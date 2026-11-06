@@ -89,8 +89,24 @@ Hệ thống cung cấp và tích hợp các API sau:
 | `documentName` | `string` | **Có** | Tên tài liệu cần ký (độ dài 10 - 200 ký tự, đã lọc ký tự điều khiển). |
 | `organizationName` | `string` | **Có** | Tên đơn vị gửi yêu cầu ký (Mặc định: `"Cas Sign"`). |
 | `identificationNumber`| `string` | Không | Số CCCD/CMND của người ký (tùy chọn, không bắt buộc). |
-| `taxCode` | `string` | Điều kiện | Mã số thuế doanh nghiệp (Bắt buộc nếu bật chế độ Ký doanh nghiệp, gồm 10 số hoặc 10 số-3 số). |
+| `signType` | `string` | Không | Loại ký: `PERSONAL` hoặc `BUSINESS`. Khi gửi, người ký **không được đổi** loại ký. Không gửi = người ký tự chọn. |
+| `taxCode` | `string` | Không | Mã số thuế (10 số hoặc 10 số-3 số). Có MST thì người ký **bắt buộc** dùng chứng thư số của đúng doanh nghiệp đó. Không có MST **không còn mặc định là ký cá nhân**, loại ký do `signType` quyết định. UI chỉ gửi kèm khi chọn `BUSINESS`. |
 | `signatureFields` | `string (JSON)` | **Có** | Danh sách tọa độ vùng ký được mã hóa JSON (Xem chi tiết mục 4.4). |
+
+#### Quy tắc `signatureFields` (sai sẽ trả `E_SIGN_SIGNATURE_FIELDS_INVALID`):
+- Là JSON array hợp lệ, có ít nhất 1 phần tử.
+- `page`: số nguyên ≥ 1.
+- `xRatio`, `yRatio`, `widthRatio`, `heightRatio`: bắt buộc, trong khoảng 0–1.
+- `xRatio + widthRatio ≤ 1` và `yRatio + heightRatio ≤ 1` (khung ký không tràn ra ngoài trang).
+- `fieldType`: không bắt buộc, `SIGNATURE` | `INITIAL` | `STAMP` (không phân biệt hoa thường), mặc định `SIGNATURE`.
+
+#### Phản hồi lỗi (HTTP 400):
+```json
+{ "requestId": "CAS-...", "errorType": "...", "errorCode": "INVALID_PARAM", "errorMessage": "lỗi 1, lỗi 2" }
+```
+- `INVALID_PARAM`: sai format input; nếu sai nhiều field, `errorMessage` ghép các lỗi cách nhau bằng dấu phẩy (UI tách thành danh sách).
+- `E_SIGN_SIGNATURE_FIELDS_INVALID`: vi phạm quy tắc `signatureFields` ở trên.
+- Proxy `/api/esign` validate `signType` và `signatureFields` trước khi forward và trả lỗi cùng format này (logic dùng chung tại `lib/request-document.ts`).
 
 #### Phản hồi mẫu thành công (HTTP 200):
 ```json
